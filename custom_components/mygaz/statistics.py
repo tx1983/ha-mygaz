@@ -1,26 +1,32 @@
-"""One-off import of counter reading history into long-term statistics.
+"""Backfill meter reading history into the sensor's own statistics.
 
-Each counter gets an external statistic ``mygaz:<uuid>_consumption`` holding
-the cumulative consumption (m³) rebuilt from the API's per-period ``rate``
-deltas. Cumulative consumption (rather than raw meter readings) is imported
-so meter replacements/resets never produce negative spikes — a new meter
-starts from a low reading and its negative delta is simply skipped.
+The counter «Показания» sensors are TOTAL_INCREASING — their statistics are
+what the History panel graphs and what the energy dashboard consumes. This
+module imports the API's reading history straight into the ``sensor.<...>``
+statistic rows so both show the full staircase immediately instead of only
+data collected after install.
 
-Import is skipped when the statistic already has rows, so re-runs on every
-startup are cheap and idempotent.
+Only rows older than the oldest recorded statistic are imported — hourly
+stats already written by the recorder are never touched, and restarts don't
+duplicate data. Readings that drop below the previous accepted value (meter
+replacement/correction artefacts like a reset to 4 after 4026) are skipped
+to keep the cumulative series monotonic.
 """
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.recorder.statistics import (
     StatisticData,
     StatisticMetaData,
-    async_add_external_statistics,
     get_last_statistics,
+    import_statistics,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
 from .coordinator import MyGazCoordinator
@@ -29,28 +35,70 @@ from .sensor import _float, _measure, _naive, _parse_dt
 _LOGGER = logging.getLogger(__name__)
 
 
-def _consumption_stats(counter: dict[str, Any]) -> list[StatisticData]:
-    """Build cumulative-consumption stats from the readings list."""
+def _history_stats(counter: dict[str, Any]) -> list[StatisticData]:
+    """Monotonic {start, state, sum} rows from the counter's readings."""
     values = [v for v in counter.get("values") or [] if isinstance(v, dict)]
     values.sort(key=lambda v: _naive(v.get("dateDt") or v.get("date")))
-    by_start: dict[Any, float] = {}
-    total = 0.0
+    stats: list[StatisticData] = []
+    top: float | None = None
     for value in values:
         start = _parse_dt(value.get("dateDt")) or _parse_dt(value.get("date"))
-        if start is None:
+        reading = _float(value.get("valueDay"))
+        if start is None or reading is None:
             continue
-        rate = _float(value.get("rate"))
-        # Negative/missing deltas are resets or corrections, not usage.
-        if rate and rate > 0:
-            total += rate
-        by_start[start] = total  # same-date rows: keep the accumulated last
-    return [StatisticData(start=start, sum=by_start[start]) for start in by_start]
+        if top is not None and reading <= top:
+            continue  # reset/correction artefact — keep the series monotonic
+        top = reading
+        stats.append(StatisticData(start=start, state=reading, sum=reading))
+    return stats
+
+
+def _stat_start(row: dict[str, Any]) -> datetime | None:
+    """Normalize the 'start' value returned by get_last_statistics."""
+    start = row.get("start")
+    if isinstance(start, datetime):
+        return start
+    if isinstance(start, (int, float)):
+        return dt_util.utc_from_timestamp(start)
+    return _parse_dt(start)
+
+
+async def _import_for_counter(
+    hass: HomeAssistant, entity_id: str, unit: str, counter: dict[str, Any]
+) -> None:
+    """Import history rows older than the entity's oldest statistic."""
+    stats = _history_stats(counter)
+    if not stats:
+        return
+    existing = await hass.async_add_executor_job(
+        get_last_statistics, hass, 5000, entity_id, True, {"sum"}
+    )
+    rows = existing.get(entity_id) or []
+    starts = [s for s in (_stat_start(r) for r in rows) if s]
+    oldest = min(starts, default=None)
+    if oldest is not None:
+        stats = [s for s in stats if s["start"] < oldest]
+    if not stats:
+        return
+    metadata = StatisticMetaData(
+        has_mean=False,
+        has_sum=True,
+        name=None,
+        source="recorder",
+        statistic_id=entity_id,
+        unit_of_measurement=unit,
+    )
+    await hass.async_add_executor_job(import_statistics, hass, metadata, stats)
+    _LOGGER.debug(
+        "Импортировано %d записей истории в %s", len(stats), entity_id
+    )
 
 
 async def async_import_history(
     hass: HomeAssistant, coordinator: MyGazCoordinator
 ) -> None:
-    """Import history for every counter that does not have stats yet."""
+    """Import each counter's history into its sensor statistics, once."""
+    registry = er.async_get(hass)
     for account_id in coordinator.data or {}:
         info = coordinator.data[account_id].get("info") or {}
         for counter in info.get("counters") or []:
@@ -58,31 +106,14 @@ async def async_import_history(
             _, unit = _measure(counter.get("measure"))
             if not uuid or not unit:
                 continue
-            statistic_id = f"{DOMAIN}:{uuid}_consumption"
-            stats = _consumption_stats(counter)
-            if not stats:
+            entity_id = registry.async_get_entity_id(
+                "sensor", DOMAIN, f"{DOMAIN}_{uuid}_reading"
+            )
+            if not entity_id:
                 continue
             try:
-                last = await hass.async_add_executor_job(
-                    get_last_statistics, hass, 1, statistic_id, True, {"sum"}
-                )
-                if last.get(statistic_id):
-                    continue
-                metadata = StatisticMetaData(
-                    has_mean=False,
-                    has_sum=True,
-                    name=f"Счётчик {counter.get('serialNumber') or counter.get('name')} — расход (история)",
-                    source=DOMAIN,
-                    statistic_id=statistic_id,
-                    unit_of_measurement=unit,
-                )
-                await async_add_external_statistics(hass, metadata, stats)
-                _LOGGER.debug(
-                    "Импортировано %d записей истории в %s",
-                    len(stats),
-                    statistic_id,
-                )
+                await _import_for_counter(hass, entity_id, unit, counter)
             except Exception:
                 _LOGGER.exception(
-                    "Не удалось импортировать историю %s", statistic_id
+                    "Не удалось импортировать историю %s", entity_id
                 )

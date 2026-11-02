@@ -10,7 +10,7 @@ Unofficial [Home Assistant](https://www.home-assistant.io/) integration for the 
 - **Mutual settlements** — one device per provider account (ЛСПУ) with the same rows the cabinet shows: month start/end balance, charged sum and volume, adjustments, payments, recalculations
 - **Per-service balance** — amount due for every service (gas supply, insurance, …) with tariff/norm/price attributes
 - **Meter readings** — one device per meter: last reading (`TOTAL_INCREASING`, works with the energy dashboard), consumption per period, next verification date; serial/model/check date in attributes
-- **Reading history** — full history in sensor attributes (last 24 records with consumption, state and source) plus a one-off backfill into Home Assistant long-term statistics (`mygaz:<uuid>_consumption`), so the energy dashboard shows past periods right away
+- **Reading history** — full history in sensor attributes (last 24 records with consumption, state and source) plus a one-off backfill into the sensor's own statistics: the History graph and the energy dashboard show past periods right away
 - **Messages** — unread count with the full inbox in attributes, plus a sensor holding the last message text
 - **Multiple accounts** — every account on the login becomes its own device
 - **Login + password auth** — `signInN3` GraphQL mutation; the token is refreshed automatically and re-authentication is only requested if the password itself stops working
