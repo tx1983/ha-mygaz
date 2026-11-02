@@ -14,10 +14,12 @@ to keep the cumulative series monotonic.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 from datetime import datetime
 from typing import Any
 
+from homeassistant.components.recorder.models import Statistics
 from homeassistant.components.recorder.statistics import (
     StatisticData,
     StatisticMetaData,
@@ -33,6 +35,10 @@ from .coordinator import MyGazCoordinator
 from .sensor import _float, _measure, _naive, _parse_dt
 
 _LOGGER = logging.getLogger(__name__)
+
+# Newer HA requires the target table (Statistics vs StatisticsShortTerm)
+# as an extra positional argument to import_statistics.
+_IMPORT_NEEDS_TABLE = "table" in inspect.signature(import_statistics).parameters
 
 
 def _history_stats(counter: dict[str, Any]) -> list[StatisticData]:
@@ -88,7 +94,10 @@ async def _import_for_counter(
         statistic_id=entity_id,
         unit_of_measurement=unit,
     )
-    await hass.async_add_executor_job(import_statistics, hass, metadata, stats)
+    args: tuple = (hass, metadata, stats)
+    if _IMPORT_NEEDS_TABLE:
+        args += (Statistics,)
+    await hass.async_add_executor_job(import_statistics, *args)
     _LOGGER.debug(
         "Импортировано %d записей истории в %s", len(stats), entity_id
     )
