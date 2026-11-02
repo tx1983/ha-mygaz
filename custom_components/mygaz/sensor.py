@@ -387,6 +387,8 @@ class MyGazServiceParamSensor(MyGazLspuSensor):
         self._attr_unique_id = f"{DOMAIN}_{lspu_id}_{self._service_id}_{self._kind}"
         self._attr_name = f"{service.get('name') or 'Услуга'} — {label}"
         self._attr_icon = icon
+        # Price stats feed the energy dashboard's entity_energy_price cost.
+        self._attr_state_class = SensorStateClass.MEASUREMENT
         super().__init__(coordinator, account_id, lspu_id)
         measure = (self._provider(service.get("providerId")).get("type") or {}).get(
             "measure"
