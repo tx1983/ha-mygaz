@@ -14,6 +14,7 @@ from .const import (
     DEFAULT_SCAN_INTERVAL_MINUTES,
 )
 from .coordinator import MyGazConfigEntry, MyGazCoordinator
+from .statistics import async_import_history
 
 PLATFORMS = [Platform.SENSOR]
 
@@ -32,6 +33,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: MyGazConfigEntry) -> boo
     entry.runtime_data = coordinator
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Backfill meter history into long-term statistics in the background.
+    entry.async_create_background_task(
+        hass, async_import_history(hass, coordinator), "mygaz_import_history"
+    )
     return True
 
 

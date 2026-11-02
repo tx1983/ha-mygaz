@@ -546,6 +546,11 @@ class MyGazCounterSensor(MyGazCounterBaseSensor):
     def extra_state_attributes(self):
         counter = self._counter()
         reading = _latest_reading(counter)
+        values = [v for v in counter.get("values") or [] if isinstance(v, dict)]
+        history = sorted(
+            values, key=lambda v: _naive(v.get("date")), reverse=True
+        )[:24]
+        submitted = [v for v in values if v.get("source") != "Биллинг"]
         return {
             "serial_number": counter.get("serialNumber"),
             "state": counter.get("state"),
@@ -559,6 +564,20 @@ class MyGazCounterSensor(MyGazCounterBaseSensor):
             "check_date": _parse_dt(counter.get("checkDate")),
             "need_verification": counter.get("needVerification"),
             "position": counter.get("position"),
+            "readings_total": len(values),
+            "last_submitted": _parse_dt(_latest(submitted, "date").get("date")),
+            "readings": [
+                {
+                    "date": _parse_dt(v.get("date")),
+                    "value_day": _float(v.get("valueDay")),
+                    "value_middle": _float(v.get("valueMiddle")),
+                    "value_night": _float(v.get("valueNight")),
+                    "rate": _float(v.get("rate")),
+                    "state": v.get("state"),
+                    "source": v.get("source"),
+                }
+                for v in history
+            ],
         }
 
 
