@@ -1,0 +1,12 @@
+{
+  "domain": "mygaz",
+  "name": "MyGaz",
+  "codeowners": ["@tx1983"],
+  "config_flow": true,
+  "documentation": "https://github.com/tx1983/ha-mygaz",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/tx1983/ha-mygaz/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "MyGaz sign in",
+        "description": "Enter the login (e-mail) and password of your «Мой ГАЗ» personal account (мойгаз.смородина.онлайн).",
+        "data": {
+          "identifier": "Login (e-mail)",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authentication required",
+        "description": "The stored credentials no longer sign in. Re-enter your «Мой ГАЗ» login and password.",
+        "data": {
+          "identifier": "Login (e-mail)",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to MyGaz",
+      "invalid_auth": "Invalid login or password",
+      "no_accounts": "No personal accounts found for this login"
+    },
+    "abort": {
+      "already_configured": "This account is already configured",
+      "reauth_successful": "Re-authentication was successful"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "scan_interval": "Update interval, minutes"
+        }
+      }
+    }
+  }
+}
