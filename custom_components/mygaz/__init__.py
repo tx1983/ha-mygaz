@@ -1,6 +1,7 @@
 """The MyGaz (Мой ГАЗ / Смородина) integration."""
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 
 from homeassistant.const import Platform
@@ -15,6 +16,8 @@ from .const import (
 )
 from .coordinator import MyGazConfigEntry, MyGazCoordinator
 from .statistics import async_import_history
+
+_LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SENSOR]
 
@@ -33,10 +36,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: MyGazConfigEntry) -> boo
     entry.runtime_data = coordinator
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    # Backfill meter history into long-term statistics in the background.
-    entry.async_create_background_task(
-        hass, async_import_history(hass, coordinator), "mygaz_import_history"
-    )
+    # Backfill meter history into long-term statistics. Must finish inside
+    # setup — if the recorder compiles a zero-point row (sum=0) before the
+    # imported tail lands, the dashboard shows a huge negative delta seam.
+    try:
+        await async_import_history(hass, coordinator)
+    except Exception:
+        _LOGGER.exception("Не удалось импортировать историю счётчиков")
     return True
 
 

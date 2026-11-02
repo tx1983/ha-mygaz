@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
 
@@ -12,6 +13,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
@@ -87,6 +89,19 @@ def _latest(items: list[dict[str, Any]], field: str = "date") -> dict[str, Any]:
     return max(items, key=lambda i: _naive(i.get(field)), default={})
 
 
+def _via_device_id(
+    hass: HomeAssistant, identifier: tuple[str, str], entry_id: str | None
+) -> str | None:
+    """Registry id of the (DOMAIN, identifier) device — for `via_device_id`."""
+    registry = dr.async_get(hass)
+    device = None
+    if (getter := getattr(registry, "async_get_device_by_identifier", None)) and entry_id:
+        device = getter(identifier, entry_id)
+    elif hasattr(registry, "async_get_device"):
+        device = registry.async_get_device(identifiers={identifier})
+    return device.id if device else None
+
+
 def _latest_reading(counter: dict[str, Any]) -> dict[str, Any]:
     """Newest accepted reading; prefer user-submitted over billing on ties."""
     values = [v for v in counter.get("values") or [] if isinstance(v, dict)]
@@ -96,6 +111,64 @@ def _latest_reading(counter: dict[str, Any]) -> dict[str, Any]:
         values,
         key=lambda v: (_naive(v.get("date")), v.get("source") != "Биллинг"),
     )
+
+
+def _price_at(regimes: list[dict[str, Any]], start: datetime) -> float | None:
+    """Price of the regime in effect at ``start`` (falls back to latest)."""
+    naive_start = start.replace(tzinfo=None)
+    best: dict[str, Any] | None = None
+    for regime in regimes:
+        begin = _naive(regime.get("startDate"))
+        end = _naive(regime.get("endDate")) if regime.get("endDate") else datetime.max
+        if begin <= naive_start < end:
+            return _float(regime.get("price"))
+        if begin <= naive_start and (best is None or begin > _naive(best.get("startDate"))):
+            best = regime
+    return _float((best or _latest(regimes, "startDate")).get("price"))
+
+
+def _iter_meter_periods(
+    counter: dict[str, Any]
+) -> Iterator[tuple[datetime, float, float | None]]:
+    """Yield (reading date, reading, volume) per accepted reading.
+
+    Volume is the API ``rate`` — delta of consecutive readings is used only
+    when ``rate`` is absent. Readings below the previous one (meter
+    replacement/correction artefacts) are skipped.
+    """
+    values = [v for v in counter.get("values") or [] if isinstance(v, dict)]
+    values.sort(key=lambda v: _naive(v.get("dateDt") or v.get("date")))
+    prev: float | None = None
+    for value in values:
+        start = _parse_dt(value.get("dateDt")) or _parse_dt(value.get("date"))
+        reading = _float(value.get("valueDay"))
+        if start is None or reading is None:
+            continue
+        if prev is not None and reading <= prev:
+            continue
+        rate = _float(value.get("rate"))
+        if rate is None and prev is not None:
+            rate = reading - prev
+        prev = reading
+        yield start, reading, rate
+
+
+def _iter_cost_periods(
+    counter: dict[str, Any], regimes: list[dict[str, Any]]
+) -> Iterator[tuple[datetime, float]]:
+    """Yield (reading date, cost) per accepted reading.
+
+    Each period's volume (delta of consecutive readings — the first one takes
+    the meter's whole pre-history) is priced at the regime in effect on its
+    date; dates outside regime coverage get the latest price. Past deltas are
+    locked at their period's price — a new tariff never revalues them.
+    """
+    prev: float | None = None
+    for start, reading, _rate in _iter_meter_periods(counter):
+        volume = reading - prev if prev is not None else reading
+        prev = reading
+        if price := _price_at(regimes, start):
+            yield start, volume * price
 
 
 async def async_setup_entry(
@@ -139,6 +212,7 @@ async def async_setup_entry(
             sensors.append(MyGazCounterSensor(coordinator, account_id, counter))
             sensors.append(MyGazCounterRateSensor(coordinator, account_id, counter))
             sensors.append(MyGazCounterCheckDateSensor(coordinator, account_id, counter))
+            sensors.append(MyGazCounterCostSensor(coordinator, account_id, counter))
 
     async_add_entities(sensors)
     _LOGGER.debug("Создано %d сенсоров MyGaz", len(sensors))
@@ -148,10 +222,26 @@ class MyGazBaseSensor(CoordinatorEntity[MyGazCoordinator], SensorEntity):
     """Базовый класс — доступ к данным координатора."""
 
     _attr_has_entity_name = True
+    # (DOMAIN, identifier) of the parent device — resolved to via_device_id
+    # lazily, since it may not be registered yet at construction time.
+    _via_identifier: tuple[str, str] | None = None
 
     def __init__(self, coordinator: MyGazCoordinator, account_id: str):
         self.account_id = account_id
         super().__init__(coordinator)
+
+    @property
+    def device_info(self):
+        info = dict(self._attr_device_info or {})
+        if self._via_identifier is not None:
+            entry_id = getattr(
+                getattr(self.coordinator, "config_entry", None), "entry_id", None
+            )
+            if via_id := _via_device_id(
+                self.coordinator.hass, self._via_identifier, entry_id
+            ):
+                info["via_device_id"] = via_id
+        return info
 
     def _block(self, name: str) -> Any:
         return (self.coordinator.data or {}).get(self.account_id, {}).get(name)
@@ -181,9 +271,9 @@ class MyGazBaseSensor(CoordinatorEntity[MyGazCoordinator], SensorEntity):
         if not lspu:
             return self._account_device_info()
         provider = self._provider_name(lspu.get("providerId")) or "Поставщик"
+        self._via_identifier = (DOMAIN, self.account_id)
         return {
             "identifiers": {(DOMAIN, f"lspu_{lspu_id}")},
-            "via_device": (DOMAIN, self.account_id),
             "name": f"{provider} ({lspu.get('number')})",
             "manufacturer": provider,
         }
@@ -387,7 +477,8 @@ class MyGazServiceParamSensor(MyGazLspuSensor):
         self._attr_unique_id = f"{DOMAIN}_{lspu_id}_{self._service_id}_{self._kind}"
         self._attr_name = f"{service.get('name') or 'Услуга'} — {label}"
         self._attr_icon = icon
-        # Price stats feed the energy dashboard's entity_energy_price cost.
+        # Can be selected as the energy dashboard's price entity
+        # (entity_energy_price) — the cost sensor reads its live state.
         self._attr_state_class = SensorStateClass.MEASUREMENT
         super().__init__(coordinator, account_id, lspu_id)
         measure = (self._provider(service.get("providerId")).get("type") or {}).get(
@@ -503,9 +594,9 @@ class MyGazCounterBaseSensor(MyGazBaseSensor):
             "serial_number": counter.get("serialNumber"),
         }
         if self._lspu_static(coordinator, account_id, lspu_id):
-            device_info["via_device"] = (DOMAIN, f"lspu_{lspu_id}")
+            self._via_identifier = (DOMAIN, f"lspu_{lspu_id}")
         else:
-            device_info["via_device"] = (DOMAIN, account_id)
+            self._via_identifier = (DOMAIN, account_id)
         self._attr_device_info = device_info
         CoordinatorEntity.__init__(self, coordinator)
 
@@ -604,6 +695,48 @@ class MyGazCounterRateSensor(MyGazCounterBaseSensor):
     @property
     def extra_state_attributes(self):
         return {"average_rate": self._counter().get("averageRate")}
+
+
+class MyGazCounterCostSensor(MyGazCounterBaseSensor):
+    """Cumulative cost of measured gas — feeds the energy dashboard stat_cost."""
+
+    def __init__(
+        self, coordinator: MyGazCoordinator, account_id: str, counter: dict[str, Any]
+    ):
+        self._attr_unique_id = f"{DOMAIN}_{counter.get('uuid')}_cost"
+        self._attr_name = "Стоимость итого"
+        self._attr_icon = "mdi:cash"
+        self._attr_device_class = SensorDeviceClass.MONETARY
+        self._attr_state_class = SensorStateClass.TOTAL
+        self._attr_native_unit_of_measurement = RUB
+        super().__init__(coordinator, account_id, counter)
+
+    def _regimes(self) -> list[dict[str, Any]]:
+        """Tariff regimes of the billed service on the counter's lspu."""
+        lspu_id = self._counter().get("lspuId")
+        for service in self._info().get("services") or []:
+            if _is_billed_service(service) and service.get("lspuId") == lspu_id:
+                return service.get("regimes") or []
+        return []
+
+    @property
+    def native_value(self):
+        total = sum(
+            delta for _, delta in _iter_cost_periods(self._counter(), self._regimes())
+        )
+        if total == 0.0:
+            # No regime-priced periods — flat day price × meter total.
+            counter = self._counter()
+            value = _float(_latest_reading(counter).get("valueDay"))
+            price = _float((counter.get("price") or {}).get("day"))
+            if value is not None and price is not None:
+                return round(value * price, 2)
+        return round(total, 2)
+
+    @property
+    def extra_state_attributes(self):
+        counter = self._counter()
+        return {"price_day": _float((counter.get("price") or {}).get("day"))}
 
 
 class MyGazCounterCheckDateSensor(MyGazCounterBaseSensor):
