@@ -12,6 +12,7 @@ Unofficial [Home Assistant](https://www.home-assistant.io/) integration for the 
 - **Meter readings** — one device per meter: last reading (`TOTAL_INCREASING`, works with the energy dashboard), consumption per period, next verification date; serial/model/check date in attributes
 - **Reading history** — full history in sensor attributes (last 24 records with consumption, state and source) plus a one-off backfill into the sensor's own statistics: the History graph and the energy dashboard show past periods right away
 - **Messages** — unread count with the full inbox in attributes, plus a sensor holding the last message text
+- **Reading submission** — a number input per tariff zone on each meter device plus a «Передать показания» button that posts the entered values via the `indicationSendV4` mutation (values wait for the button, like on the site). For automations there is also a `mygaz.submit_reading` service (target: the meter's «Новое показание» input; field: `value`)
 - **Multiple accounts** — every account on the login becomes its own device
 - **Login + password auth** — `signInN3` GraphQL mutation; the token is refreshed automatically and re-authentication is only requested if the password itself stops working
 - **Configurable polling interval** (5–1440 min, default 30)
@@ -33,7 +34,7 @@ The cabinet uses a simple token scheme: `signInN3(identifier, password)` returns
 
 ## TODO
 
-- Submitting meter readings (mutation not captured yet).
+- Payments and other write operations beyond meter readings.
 
 ## Disclaimer
 

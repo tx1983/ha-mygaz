@@ -179,6 +179,38 @@ query AccountInfo($account: AccountInput!) {
 }
 """
 
+INDICATION_SEND_MUTATION = """
+mutation indicationSendV4($deviceInfo: DeviceInfoInputV2!, $input: IndicationSendV4Input!) {
+  indicationSendV4(deviceInfo: $deviceInfo, input: $input) {
+    ok
+    error
+    data {
+      ...IndicationSendResult
+      __typename
+    }
+    __typename
+  }
+}
+
+fragment IndicationSendCounter on CounterIndicationResult {
+  uuid
+  sent
+  message
+  __typename
+}
+
+fragment IndicationSendResult on LspuIndicationResult {
+  lspuId
+  online
+  calculated
+  counters {
+    ...IndicationSendCounter
+    __typename
+  }
+  __typename
+}
+"""
+
 MESSAGES_QUERY = """
 query Messages($lsId: Int!, $isEls: Boolean!, $senderId: Int) {
   clientMessages(
@@ -203,6 +235,29 @@ query Messages($lsId: Int!, $isEls: Boolean!, $senderId: Int) {
   }
 }
 """
+
+
+# The same DeviceInfoInputV2 block the web cabinet sends on every mutation.
+_DEVICE_INFO = {
+    "appName": "desktop",
+    "appVersion": "7.9.7",
+    "browser": "Chrome 156.0.0.0",
+    "device": "",
+    "system": "Windows 11",
+    "screenResolution": "1920x1080",
+}
+
+# Tariff zone key -> IndicationSendV4 counter field.
+_ZONE_VALUE_FIELDS = {
+    "day": "valueDay",
+    "night": "valueNight",
+    "middle": "valueMiddle",
+}
+_ZONE_OVERLAP_FIELDS = {
+    "day": "overlapDay",
+    "night": "overlapNight",
+    "middle": "overlapMiddle",
+}
 
 
 class MyGazError(Exception):
@@ -237,14 +292,7 @@ class MyGazClient:
         payload = {
             "operationName": "signInN3",
             "variables": {
-                "deviceInfo": {
-                    "appName": "desktop",
-                    "appVersion": "7.9.7",
-                    "browser": "Chrome 156.0.0.0",
-                    "device": "",
-                    "system": "Windows 11",
-                    "screenResolution": "1920x1080",
-                },
+                "deviceInfo": dict(_DEVICE_INFO),
                 "input": {
                     "identifier": self.identifier,
                     "password": self._password,
@@ -353,3 +401,57 @@ class MyGazClient:
             _LOGGER.debug("clientMessages failed: %s", err)
             return []
         return data if isinstance(data, list) else []
+
+    async def async_submit_reading(
+        self,
+        *,
+        els_id: int,
+        lspu_id: int,
+        uuid: str,
+        values: dict[str, float],
+        service_id: int = 0,
+    ) -> dict[str, Any]:
+        """POST new readings of ONE meter via the indicationSendV4 mutation.
+
+        ``values`` maps tariff zone keys (``"day"``/``"night"``/``"middle"``)
+        to readings — zones absent from the map are sent as null, like the
+        cabinet does for zones the meter does not have. The ``overlap*``
+        flags are always false, mirroring the real web payload.
+
+        Returns the per-counter result row ``{uuid, sent, message}``.
+        """
+        counter_input: dict[str, Any] = {
+            "uuid": uuid,
+            "serviceId": service_id,
+        }
+        for zone, value_field in _ZONE_VALUE_FIELDS.items():
+            counter_input[value_field] = values.get(zone)
+            counter_input[_ZONE_OVERLAP_FIELDS[zone]] = False
+
+        data = await self._query(
+            "indicationSendV4",
+            INDICATION_SEND_MUTATION,
+            {
+                "deviceInfo": dict(_DEVICE_INFO),
+                "input": {
+                    "elsId": els_id,
+                    "lspuGroups": [
+                        {
+                            "lspuId": lspu_id,
+                            "counters": [counter_input],
+                        }
+                    ],
+                },
+            },
+            "indicationSendV4",
+        )
+        # data is one LspuIndicationResult per submitted lspuGroup — the
+        # API may wrap it in a list or return it bare.
+        results = data if isinstance(data, list) else [data]
+        for group in results:
+            if not isinstance(group, dict):
+                continue
+            for result in group.get("counters") or []:
+                if result.get("uuid") == uuid:
+                    return result
+        raise MyGazError("indicationSendV4 returned no result for the counter")

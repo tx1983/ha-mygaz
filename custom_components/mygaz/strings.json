@@ -36,5 +36,28 @@
         }
       }
     }
+  },
+  "services": {
+    "submit_reading": {
+      "name": "Submit meter reading",
+      "description": "Sends a new meter reading to the «Мой ГАЗ» personal account. Target the meter's «New reading» input field.",
+      "fields": {
+        "value": {
+          "name": "Reading",
+          "description": "New meter reading."
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "no_pending_readings": {
+      "message": "No new readings entered — type a value into the reading field first."
+    },
+    "not_a_reading_field": {
+      "message": "Select a meter's «New reading» input field (a MyGaz number entity)."
+    },
+    "entry_not_loaded": {
+      "message": "The meter's config entry is not loaded."
+    }
   }
 }

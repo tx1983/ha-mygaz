@@ -1,0 +1,15 @@
+submit_reading:
+  target:
+    entity:
+      integration: mygaz
+      domain: number
+  fields:
+    value:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 999999
+          step: 0.001
+          mode: box
+          unit_of_measurement: m³
