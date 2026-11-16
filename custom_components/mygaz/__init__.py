@@ -7,10 +7,11 @@ from datetime import timedelta
 
 import voluptuous as vol
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.start import async_at_started
 
 from .api import MyGazClient, async_get_session
 from .const import (
@@ -102,14 +103,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: MyGazConfigEntry) -> boo
     entry.runtime_data = coordinator
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    # Backfill meter history into long-term statistics. Must finish inside
-    # setup — if the recorder compiles a zero-point row (sum=0) before the
-    # imported tail lands, the dashboard shows a huge negative delta seam.
+
+    # Backfill meter/accrual history into long-term statistics in the
+    # background once HA has started: during boot the recorder doesn't work
+    # its queue yet, so doing it inside setup only held the entry back.
+    @callback
+    def _start_history_import(_hass: HomeAssistant) -> None:
+        entry.async_create_background_task(
+            hass,
+            _async_import_history(hass, coordinator),
+            f"{DOMAIN} history import {entry.entry_id}",
+        )
+
+    entry.async_on_unload(async_at_started(hass, _start_history_import))
+    return True
+
+
+async def _async_import_history(
+    hass: HomeAssistant, coordinator: MyGazCoordinator
+) -> None:
     try:
         await async_import_history(hass, coordinator)
     except Exception:
         _LOGGER.exception("Не удалось импортировать историю счётчиков")
-    return True
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: MyGazConfigEntry) -> None:

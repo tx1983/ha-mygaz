@@ -21,14 +21,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from collections.abc import Awaitable
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.recorder.statistics import (
     StatisticData,
     StatisticMetaData,
-    get_last_statistics,
     import_statistics,
+    statistics_during_period,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
@@ -92,7 +93,7 @@ def _cost_stats(
 
 
 def _stat_start(row: dict[str, Any]) -> datetime | None:
-    """Normalize the 'start' value returned by get_last_statistics."""
+    """Normalize the 'start' value of a recorded statistics row."""
     start = row.get("start")
     if isinstance(start, datetime):
         return start
@@ -115,25 +116,78 @@ def _metadata(hass: HomeAssistant, entity_id: str, unit: str, has_mean: bool, ha
     }
 
 
+# Lower bound for "everything recorded so far" queries.
+_EPOCH = datetime(2000, 1, 1, tzinfo=dt_util.UTC)
+
+
+async def _db_job(hass: HomeAssistant, func: Any, *args: Any) -> Any:
+    """Run a statistics query on the recorder's own database executor."""
+    try:
+        from homeassistant.components.recorder import get_instance
+
+        instance = get_instance(hass)
+    except Exception:  # recorder not loaded / internals differ
+        instance = None
+    if instance is not None:
+        return await instance.async_add_executor_job(func, *args)
+    return await hass.async_add_executor_job(func, *args)
+
+
+async def _recorded_rows(
+    hass: HomeAssistant,
+    entity_id: str,
+    start: datetime,
+    end: datetime | None,
+    stat_types: set[str],
+) -> list[dict[str, Any]]:
+    """Hourly statistic rows of ``entity_id`` with ``start <= row < end``."""
+    result = await _db_job(
+        hass,
+        statistics_during_period,
+        hass,
+        start,
+        end,
+        {entity_id},
+        "hour",
+        None,
+        stat_types,
+    )
+    return list((result or {}).get(entity_id) or [])
+
+
 async def _import_stats(
     hass: HomeAssistant,
     entity_id: str,
     metadata: dict[str, Any],
     stats: list[StatisticData],
     stat_types: set[str],
-) -> None:
-    """Import stats rows older than the entity's oldest recorded statistic."""
+) -> bool:
+    """Import stats rows older than the entity's oldest recorded statistic.
+
+    Two bounded queries instead of scanning the latest N rows:
+
+    1. rows at or before the oldest candidate — any hit means the history is
+       already in the database (the usual restart): done after a tiny query;
+    2. only when something may be imported — rows from the oldest candidate
+       on: the real oldest recorded row plus the rows after the imported
+       tail for the negative-seam check.
+
+    Returns True when rows were queued for import.
+    """
     if not stats:
-        return
-    existing = await hass.async_add_executor_job(
-        get_last_statistics, hass, 5000, entity_id, True, stat_types
-    )
-    rows = existing.get(entity_id) or []
+        return False
+    stats = sorted(stats, key=lambda s: s["start"])
+    first = stats[0]["start"]
+    if await _recorded_rows(
+        hass, entity_id, _EPOCH, first + timedelta(hours=1), stat_types
+    ):
+        return False
+    rows = await _recorded_rows(hass, entity_id, first, None, stat_types)
     starts = [s for s in (_stat_start(r) for r in rows) if s]
     if (oldest := min(starts, default=None)) is not None:
         stats = [s for s in stats if s["start"] < oldest]
     if not stats:
-        return
+        return False
     # A stale row after the imported tail with a lower sum (e.g. a zero-point
     # left behind by a purge) becomes a huge negative delta in the dashboard.
     # The import can't fix existing rows — warn so the entity can be purged.
@@ -185,6 +239,7 @@ async def _import_stats(
             import_statistics, hass, StatisticMetaData(**metadata), stats
         )
     _LOGGER.debug("Импортировано %d записей истории в %s", len(stats), entity_id)
+    return True
 
 
 def _seed_short_term(
@@ -227,15 +282,16 @@ def _provider_measure(info: dict[str, Any], provider_id: Any) -> Any:
     return None
 
 
-async def _import_price_history(
+def _price_jobs(
     hass: HomeAssistant,
     registry: er.EntityRegistry,
     info: dict[str, Any],
     starts: set[datetime],
-) -> None:
-    """Backfill service price entities with mean stats at reading hours."""
+) -> list[Awaitable[bool]]:
+    """Imports backfilling service price entities with mean stats at reading hours."""
+    jobs: list[Awaitable[bool]] = []
     if not starts:
-        return
+        return jobs
     for service in info.get("services") or []:
         if not _is_billed_service(service):
             continue
@@ -249,52 +305,75 @@ async def _import_price_history(
         )
         if not entity_id:
             continue
-        _, unit = _measure(
-            _provider_measure(info, service.get("providerId"))
-        )
-        price_unit = f"₽/{unit}" if unit else "₽"
-        stats = [
-            StatisticData(start=s, state=p, mean=p, min=p, max=p)
-            for s in sorted(starts)
-            if (p := _price_at(regimes, s)) is not None
-        ]
         try:
-            await _import_stats(
-                hass,
-                entity_id,
-                _metadata(hass, entity_id, price_unit, True, False),
-                stats,
-                {"mean"},
+            _, unit = _measure(
+                _provider_measure(info, service.get("providerId"))
             )
+            price_unit = f"₽/{unit}" if unit else "₽"
+            stats = [
+                StatisticData(start=s, state=p, mean=p, min=p, max=p)
+                for s in sorted(starts)
+                if (p := _price_at(regimes, s)) is not None
+            ]
         except Exception:
-            _LOGGER.exception("Не удалось импортировать цены %s", entity_id)
+            _LOGGER.exception("Не удалось подготовить цены %s", entity_id)
+            continue
+        jobs.append(
+            _safe(
+                _import_stats(
+                    hass,
+                    entity_id,
+                    _metadata(hass, entity_id, price_unit, True, False),
+                    stats,
+                    {"mean"},
+                ),
+                entity_id,
+            )
+        )
+    return jobs
 
 
-async def _drain_recorder(hass: HomeAssistant) -> None:
-    """Wait briefly for the recorder to commit queued statistic inserts.
-
-    ``async_import_statistics`` only enqueues the write — without the drain a
-    statistics compile can run first, see "no stats" and write a zero-point
-    row, which later renders as a giant negative delta in the dashboard.
-    The wait is bounded: a stuck recorder queue must never hang entry setup.
-    """
+async def _safe(coro: Awaitable[bool], entity_id: str) -> bool:
+    """Run one entity's import; a failure must not stop the others."""
     try:
-        from homeassistant.components.recorder import get_instance
-
-        if (instance := get_instance(hass)) is None:
-            return
-        await asyncio.wait_for(instance.async_block_till_done(), timeout=60)
-    except (asyncio.TimeoutError, TimeoutError):
-        _LOGGER.warning("Очередь recorder не освободилась за 60с — продолжаем")
-    except Exception:  # best effort — recorder internals vary by version
-        _LOGGER.debug("Не удалось дождаться очереди recorder", exc_info=True)
+        return await coro
+    except Exception:
+        _LOGGER.exception("Не удалось импортировать историю %s", entity_id)
+        return False
 
 
 async def async_import_history(
     hass: HomeAssistant, coordinator: MyGazCoordinator
 ) -> None:
-    """Import each counter's history into its sensor statistics, once."""
+    """Import each counter's history into its sensor statistics.
+
+    All entities are checked concurrently; on a usual restart every check is
+    one tiny query and nothing is imported.
+    """
     registry = er.async_get(hass)
+    jobs: list[Awaitable[bool]] = []
+
+    def add(entity_id: str | None, unit: str, build: Any) -> None:
+        if not entity_id:
+            return
+        try:
+            stats = build()
+        except Exception:
+            _LOGGER.exception("Не удалось подготовить историю %s", entity_id)
+            return
+        jobs.append(
+            _safe(
+                _import_stats(
+                    hass,
+                    entity_id,
+                    _metadata(hass, entity_id, unit, False, True),
+                    stats,
+                    {"sum"},
+                ),
+                entity_id,
+            )
+        )
+
     for account_id in coordinator.data or {}:
         info = coordinator.data[account_id].get("info") or {}
         regimes_by_lspu = {
@@ -308,41 +387,31 @@ async def async_import_history(
             _, unit = _measure(counter.get("measure"))
             if not uuid or not unit:
                 continue
-            entity_id = registry.async_get_entity_id(
-                "sensor", DOMAIN, f"{DOMAIN}_{uuid}_reading"
-            )
-            stats = _history_stats(counter)
+            try:
+                stats = _history_stats(counter)
+            except Exception:
+                _LOGGER.exception("Не удалось подготовить историю счётчика %s", uuid)
+                stats = []
             starts.update(s["start"] for s in stats)
-            if entity_id:
-                try:
-                    await _import_stats(
-                        hass,
-                        entity_id,
-                        _metadata(hass, entity_id, unit, False, True),
-                        stats,
-                        {"sum"},
-                    )
-                except Exception:
-                    _LOGGER.exception(
-                        "Не удалось импортировать историю %s", entity_id
-                    )
-            cost_entity_id = registry.async_get_entity_id(
-                "sensor", DOMAIN, f"{DOMAIN}_{uuid}_cost"
+            add(
+                registry.async_get_entity_id(
+                    "sensor", DOMAIN, f"{DOMAIN}_{uuid}_reading"
+                ),
+                unit,
+                lambda stats=stats: stats,
             )
-            if cost_entity_id:
-                try:
-                    await _import_stats(
-                        hass,
-                        cost_entity_id,
-                        _metadata(hass, cost_entity_id, "₽", False, True),
-                        _cost_stats(
-                            counter, regimes_by_lspu.get(counter.get("lspuId")) or []
-                        ),
-                        {"sum"},
-                    )
-                except Exception:
-                    _LOGGER.exception(
-                        "Не удалось импортировать стоимость %s", cost_entity_id
-                    )
-        await _import_price_history(hass, registry, info, starts)
-    await _drain_recorder(hass)
+            add(
+                registry.async_get_entity_id(
+                    "sensor", DOMAIN, f"{DOMAIN}_{uuid}_cost"
+                ),
+                "₽",
+                lambda counter=counter: _cost_stats(
+                    counter, regimes_by_lspu.get(counter.get("lspuId")) or []
+                ),
+            )
+        jobs.extend(_price_jobs(hass, registry, info, starts))
+
+    imported = await asyncio.gather(*jobs)
+    _LOGGER.debug(
+        "История: проверено %d сущностей, импорт в %d", len(jobs), sum(imported)
+    )
