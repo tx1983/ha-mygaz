@@ -8,8 +8,10 @@ data collected after install. It also backfills the service «стоимость
 price sensor with hourly mean rows at the same timestamps — useful for the
 history panel; note the energy dashboard's price option (entity_energy_price)
 reads the entity's live state, not its statistics, and costs are only accrued
-going forward. For historic costs the dashboard must use the «Стоимость итого»
-sensor as stat_cost — its history is backfilled here too.
+going forward. For costs the dashboard should use the «Начислено итого»
+sensor (running total of the real monthly charges) as stat_cost — its
+history is backfilled here too. The legacy «Стоимость итого» (readings ×
+tariff) is still backfilled for installs that keep it enabled.
 
 Only rows older than the oldest recorded statistic are imported — hourly
 stats already written by the recorder are never touched, and restarts don't
@@ -38,6 +40,7 @@ from homeassistant.util import dt as dt_util
 from .const import DOMAIN
 from .coordinator import MyGazCoordinator
 from .sensor import (
+    _charged_points,
     _float,
     _is_billed_service,
     _iter_cost_periods,
@@ -86,6 +89,26 @@ def _cost_stats(
         total += delta
         start = start.replace(minute=0, second=0, microsecond=0)
         stats = [s for s in stats if s["start"] != start]
+        stats.append(
+            StatisticData(start=start, state=round(total, 2), sum=round(total, 2))
+        )
+    return stats
+
+
+def _charged_total_stats(rows: list[dict[str, Any]]) -> list[StatisticData]:
+    """Running total of the periods' ``chargedSum`` — «Начислено итого».
+
+    Built from the same points the live sensor sums on its first run, so
+    the imported tail and the sensor state agree.
+    """
+    stats: list[StatisticData] = []
+    total = 0.0
+    for date, value in _charged_points(rows):
+        start = _parse_dt(date)
+        if start is None:
+            continue
+        total += value
+        start = start.replace(minute=0, second=0, microsecond=0)
         stats.append(
             StatisticData(start=start, state=round(total, 2), sum=round(total, 2))
         )
@@ -410,6 +433,23 @@ async def async_import_history(
                 ),
             )
         jobs.extend(_price_jobs(hass, registry, info, starts))
+
+        # --- running total of charges (₽) per settlement group -------------
+        # «Начислено итого»: its state is the running total itself, so every
+        # imported row has state == sum, like the live sensor.
+        groups: dict[tuple, list[dict[str, Any]]] = {}
+        for balance in info.get("balances") or []:
+            groups.setdefault(
+                (balance.get("lspuId"), balance.get("uuid")), []
+            ).append(balance)
+        for (lspu_id, uuid), rows in groups.items():
+            add(
+                registry.async_get_entity_id(
+                    "sensor", DOMAIN, f"{DOMAIN}_{lspu_id}_{uuid}_charged_total"
+                ),
+                "₽",
+                lambda rows=rows: _charged_total_stats(rows),
+            )
 
     imported = await asyncio.gather(*jobs)
     _LOGGER.debug(

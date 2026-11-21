@@ -8,8 +8,10 @@ Unofficial [Home Assistant](https://www.home-assistant.io/) integration for the 
 
 - **Amount due** (RUB) per personal account (ЕЛС)
 - **Mutual settlements** — one device per provider account (ЛСПУ) with the same rows the cabinet shows: month start/end balance, charged sum and volume, adjustments, payments, recalculations
+- **Charged total** (RUB) — «Начислено итого» on every provider account device: running total of the real monthly charges (`MONETARY`, `TOTAL`, `chargedSum` of each billing period). Each new period adds its own charge; a repeated poll of the same period adds nothing, and if the cabinet re-bills an already counted period only the difference is added. The total survives restarts. **Use this sensor as the cost entity of the energy dashboard and in statistics graphs** — a tariff change never rewrites its history.
 - **Per-service balance** — amount due for every service (gas supply, insurance, …) with tariff/norm/price attributes
 - **Meter readings** — one device per meter: last reading (`TOTAL_INCREASING`, works with the energy dashboard), consumption per period, next verification date; serial/model/check date in attributes
+- **Cost total (legacy)** — «Стоимость итого» on the meter device is an estimate (readings × the current tariff): when the tariff changes, its whole history is revalued and the statistics get a false spike. It is **disabled by default**; for expense tracking use «Начислено итого».
 - **Reading history** — full history in sensor attributes (last 24 records with consumption, state and source) plus a one-off backfill into the sensor's own statistics: the History graph and the energy dashboard show past periods right away
 - **Messages** — unread count with the full inbox in attributes, plus a sensor holding the last message text
 - **Reading submission** — a number input per tariff zone on each meter device plus a «Передать показания» button that posts the entered values via the `indicationSendV4` mutation (values wait for the button, like on the site). For automations there is also a `mygaz.submit_reading` service (target: the meter's «Новое показание» input; field: `value`)

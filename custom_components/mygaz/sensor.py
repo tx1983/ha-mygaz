@@ -12,9 +12,10 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
@@ -206,6 +207,9 @@ async def async_setup_entry(
             sensors.extend(
                 MyGazSettlementSensor(coordinator, account_id, lspu_id, uuid, kind)
                 for kind in MyGazSettlementSensor.KINDS
+            )
+            sensors.append(
+                MyGazChargedTotalSensor(coordinator, account_id, lspu_id, uuid)
             )
 
         for counter in info.get("counters") or []:
@@ -575,6 +579,162 @@ class MyGazSettlementSensor(MyGazLspuSensor):
         }
 
 
+def _period(value: Any) -> str | None:
+    """ISO date (local) of a settlement row's billing period."""
+    dt = _parse_dt(value)
+    return dt_util.as_local(dt).date().isoformat() if dt else None
+
+
+def _charged_points(rows: list[dict[str, Any]]) -> list[tuple[str, float]]:
+    """(ISO date of the period, chargedSum) sorted by period.
+
+    Rows without a date or a charged sum are left out — such a period is
+    neither counted nor marked as counted, so it is picked up on a later
+    poll once the cabinet fills it in. Duplicate periods keep the last row.
+    """
+    points: dict[str, float] = {}
+    for row in rows:
+        date = _period(row.get("date"))
+        value = _float(row.get("chargedSum"))
+        if date and value is not None:
+            points[date] = value
+    return sorted(points.items())
+
+
+class MyGazChargedTotalSensor(MyGazLspuSensor, RestoreEntity):
+    """Накопительная сумма начислений — источник стоимости для энерго-дашборда.
+
+    «Сумма начислений» показывает начисление за последний расчётный период;
+    «Стоимость итого» на счётчике пересчитывает все показания по текущему
+    тарифу, и смена тарифа переписывает всю историю. Здесь каждый новый
+    период прибавляет к сумме своё реальное начисление (``chargedSum``),
+    поэтому прирост статистики равен начислению за период по его тарифу.
+
+    Кабинет отдаёт только окно последних периодов, поэтому сумма, последний
+    учтённый период и учтённое по нему начисление переживают рестарт
+    (RestoreEntity). Повторный опрос того же периода ничего не добавляет;
+    если кабинет изменил начисление уже учтённого периода, прибавляется
+    только разница. Пока не закончен импорт истории, сенсор недоступен —
+    компилятор статистики не запишет «нулевую точку» раньше
+    импортированного хвоста.
+    """
+
+    def __init__(
+        self,
+        coordinator: MyGazCoordinator,
+        account_id: str,
+        lspu_id: Any,
+        uuid: Any,
+    ):
+        self._uuid = uuid
+        super().__init__(coordinator, account_id, lspu_id)
+        self._attr_unique_id = f"{DOMAIN}_{lspu_id}_{uuid}_charged_total"
+        self._attr_name = f"{self._row().get('name') or 'Услуга'} — Начислено итого"
+        self._attr_icon = "mdi:cash-multiple"
+        self._attr_device_class = SensorDeviceClass.MONETARY
+        self._attr_state_class = SensorStateClass.TOTAL
+        self._attr_native_unit_of_measurement = RUB
+        self._total: float | None = None
+        self._last_period: str | None = None
+        self._last_charged: float | None = None
+
+    def _rows(self) -> list[dict[str, Any]]:
+        return [
+            b
+            for b in self._info().get("balances") or []
+            if b.get("lspuId") == self.lspu_id and b.get("uuid") == self._uuid
+        ]
+
+    def _row(self) -> dict[str, Any]:
+        return _latest(self._rows())
+
+    def _fold(self) -> None:
+        """Add periods newer than the last counted one to the total."""
+        points = _charged_points(self._rows())
+        if not points:
+            return
+        if self._total is None or self._last_period is None:
+            # First run: the whole visible history — the same rows the
+            # statistics import sums up, so state and statistics agree.
+            self._total = round(sum(v for _, v in points), 2)
+            self._last_period, self._last_charged = points[-1]
+            return
+        total = self._total
+        for date, value in points:
+            if date > self._last_period:
+                total += value
+                self._last_period, self._last_charged = date, value
+            elif date == self._last_period:
+                # The counted period was re-billed (recalculation in the
+                # cabinet) — add only the difference. Unknown counted amount
+                # (restored from an older state): take the value as counted.
+                if self._last_charged is not None:
+                    total += value - self._last_charged
+                self._last_charged = value
+        self._total = round(total, 2)
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if (extra := await self.async_get_last_extra_data()) is not None:
+            data = extra.as_dict()
+            total = _float(data.get("total"))
+            if total is not None and data.get("last_period"):
+                self._total = total
+                self._last_period = str(data["last_period"])
+                self._last_charged = _float(data.get("last_charged"))
+        self._fold()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._fold()
+        super()._handle_coordinator_update()
+
+    @property
+    def available(self) -> bool:
+        return (
+            super().available
+            and self.coordinator.history_ready
+            and self._total is not None
+        )
+
+    @property
+    def native_value(self):
+        return self._total
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            "service": self._row().get("name"),
+            "last_period": self._last_period,
+            "last_charged": self._last_charged,
+        }
+
+    @property
+    def extra_restore_state_data(self) -> ExtraStoredData:
+        return _ChargedTotalData(self._total, self._last_period, self._last_charged)
+
+
+class _ChargedTotalData(ExtraStoredData):
+    """Restored running total of the «Начислено итого» sensor."""
+
+    def __init__(
+        self,
+        total: float | None,
+        last_period: str | None,
+        last_charged: float | None,
+    ) -> None:
+        self.total = total
+        self.last_period = last_period
+        self.last_charged = last_charged
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "total": self.total,
+            "last_period": self.last_period,
+            "last_charged": self.last_charged,
+        }
+
+
 class MyGazCounterBaseSensor(MyGazBaseSensor):
     """Базовый класс сенсоров счётчика — отдельное устройство под ЛСПУ."""
 
@@ -698,7 +858,13 @@ class MyGazCounterRateSensor(MyGazCounterBaseSensor):
 
 
 class MyGazCounterCostSensor(MyGazCounterBaseSensor):
-    """Cumulative cost of measured gas — feeds the energy dashboard stat_cost."""
+    """Estimated cost of measured gas: readings × tariff.
+
+    Deprecated as a cost source: the cabinet only exposes the current
+    regime, so a tariff change revalues the whole meter history and puts a
+    false spike into the statistics. Disabled by default — for the energy
+    dashboard and statistics use «Начислено итого» on the provider device.
+    """
 
     def __init__(
         self, coordinator: MyGazCoordinator, account_id: str, counter: dict[str, Any]
@@ -706,6 +872,7 @@ class MyGazCounterCostSensor(MyGazCounterBaseSensor):
         self._attr_unique_id = f"{DOMAIN}_{counter.get('uuid')}_cost"
         self._attr_name = "Стоимость итого"
         self._attr_icon = "mdi:cash"
+        self._attr_entity_registry_enabled_default = False
         self._attr_device_class = SensorDeviceClass.MONETARY
         self._attr_state_class = SensorStateClass.TOTAL
         self._attr_native_unit_of_measurement = RUB

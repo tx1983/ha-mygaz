@@ -34,6 +34,9 @@ class MyGazCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             ),
         )
         self.client = client
+        # Set once this run's statistics backfill has finished —
+        # «Начислено итого» stays unavailable until then.
+        self.history_ready = False
         # Values typed into the reading NumberEntities, waiting for the
         # submit button: {counter_uuid: {tariff_zone: value}}.
         self.pending: dict[str, dict[str, float]] = {}
