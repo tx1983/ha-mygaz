@@ -154,24 +154,6 @@ def _iter_meter_periods(
         yield start, reading, rate
 
 
-def _iter_cost_periods(
-    counter: dict[str, Any], regimes: list[dict[str, Any]]
-) -> Iterator[tuple[datetime, float]]:
-    """Yield (reading date, cost) per accepted reading.
-
-    Each period's volume (delta of consecutive readings — the first one takes
-    the meter's whole pre-history) is priced at the regime in effect on its
-    date; dates outside regime coverage get the latest price. Past deltas are
-    locked at their period's price — a new tariff never revalues them.
-    """
-    prev: float | None = None
-    for start, reading, _rate in _iter_meter_periods(counter):
-        volume = reading - prev if prev is not None else reading
-        prev = reading
-        if price := _price_at(regimes, start):
-            yield start, volume * price
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: MyGazConfigEntry,
@@ -216,7 +198,6 @@ async def async_setup_entry(
             sensors.append(MyGazCounterSensor(coordinator, account_id, counter))
             sensors.append(MyGazCounterRateSensor(coordinator, account_id, counter))
             sensors.append(MyGazCounterCheckDateSensor(coordinator, account_id, counter))
-            sensors.append(MyGazCounterCostSensor(coordinator, account_id, counter))
 
     async_add_entities(sensors)
     _LOGGER.debug("Создано %d сенсоров MyGaz", len(sensors))
@@ -604,11 +585,10 @@ def _charged_points(rows: list[dict[str, Any]]) -> list[tuple[str, float]]:
 class MyGazChargedTotalSensor(MyGazLspuSensor, RestoreEntity):
     """Накопительная сумма начислений — источник стоимости для энерго-дашборда.
 
-    «Сумма начислений» показывает начисление за последний расчётный период;
-    «Стоимость итого» на счётчике пересчитывает все показания по текущему
-    тарифу, и смена тарифа переписывает всю историю. Здесь каждый новый
-    период прибавляет к сумме своё реальное начисление (``chargedSum``),
-    поэтому прирост статистики равен начислению за период по его тарифу.
+    «Сумма начислений» показывает начисление за последний расчётный период.
+    Здесь каждый новый период прибавляет к сумме своё реальное начисление
+    (``chargedSum``), поэтому прирост статистики равен начислению за период
+    по его тарифу, и смена тарифа историю не переписывает.
 
     Кабинет отдаёт только окно последних периодов, поэтому сумма, последний
     учтённый период и учтённое по нему начисление переживают рестарт
@@ -855,55 +835,6 @@ class MyGazCounterRateSensor(MyGazCounterBaseSensor):
     @property
     def extra_state_attributes(self):
         return {"average_rate": self._counter().get("averageRate")}
-
-
-class MyGazCounterCostSensor(MyGazCounterBaseSensor):
-    """Estimated cost of measured gas: readings × tariff.
-
-    Deprecated as a cost source: the cabinet only exposes the current
-    regime, so a tariff change revalues the whole meter history and puts a
-    false spike into the statistics. Disabled by default — for the energy
-    dashboard and statistics use «Начислено итого» on the provider device.
-    """
-
-    def __init__(
-        self, coordinator: MyGazCoordinator, account_id: str, counter: dict[str, Any]
-    ):
-        self._attr_unique_id = f"{DOMAIN}_{counter.get('uuid')}_cost"
-        self._attr_name = "Стоимость итого"
-        self._attr_icon = "mdi:cash"
-        self._attr_entity_registry_enabled_default = False
-        self._attr_device_class = SensorDeviceClass.MONETARY
-        self._attr_state_class = SensorStateClass.TOTAL
-        self._attr_native_unit_of_measurement = RUB
-        super().__init__(coordinator, account_id, counter)
-
-    def _regimes(self) -> list[dict[str, Any]]:
-        """Tariff regimes of the billed service on the counter's lspu."""
-        lspu_id = self._counter().get("lspuId")
-        for service in self._info().get("services") or []:
-            if _is_billed_service(service) and service.get("lspuId") == lspu_id:
-                return service.get("regimes") or []
-        return []
-
-    @property
-    def native_value(self):
-        total = sum(
-            delta for _, delta in _iter_cost_periods(self._counter(), self._regimes())
-        )
-        if total == 0.0:
-            # No regime-priced periods — flat day price × meter total.
-            counter = self._counter()
-            value = _float(_latest_reading(counter).get("valueDay"))
-            price = _float((counter.get("price") or {}).get("day"))
-            if value is not None and price is not None:
-                return round(value * price, 2)
-        return round(total, 2)
-
-    @property
-    def extra_state_attributes(self):
-        counter = self._counter()
-        return {"price_day": _float((counter.get("price") or {}).get("day"))}
 
 
 class MyGazCounterCheckDateSensor(MyGazCounterBaseSensor):

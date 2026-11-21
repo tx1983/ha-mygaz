@@ -10,8 +10,7 @@ history panel; note the energy dashboard's price option (entity_energy_price)
 reads the entity's live state, not its statistics, and costs are only accrued
 going forward. For costs the dashboard should use the «Начислено итого»
 sensor (running total of the real monthly charges) as stat_cost — its
-history is backfilled here too. The legacy «Стоимость итого» (readings ×
-tariff) is still backfilled for installs that keep it enabled.
+history is backfilled here too.
 
 Only rows older than the oldest recorded statistic are imported — hourly
 stats already written by the recorder are never touched, and restarts don't
@@ -43,7 +42,6 @@ from .sensor import (
     _charged_points,
     _float,
     _is_billed_service,
-    _iter_cost_periods,
     _iter_meter_periods,
     _measure,
     _naive,
@@ -72,26 +70,6 @@ def _history_stats(counter: dict[str, Any]) -> list[StatisticData]:
         # Same-hour rows: keep the latest reading.
         stats = [s for s in stats if s["start"] != start]
         stats.append(StatisticData(start=start, state=reading, sum=reading))
-    return stats
-
-
-def _cost_stats(
-    counter: dict[str, Any], regimes: list[dict[str, Any]]
-) -> list[StatisticData]:
-    """Cumulative cost rows — same math as the live «Стоимость итого» sensor.
-
-    ``sum`` accumulates volume × regime price per period, so each period is
-    locked at its own price and a later tariff never revalues history.
-    """
-    stats: list[StatisticData] = []
-    total = 0.0
-    for start, delta in _iter_cost_periods(counter, regimes):
-        total += delta
-        start = start.replace(minute=0, second=0, microsecond=0)
-        stats = [s for s in stats if s["start"] != start]
-        stats.append(
-            StatisticData(start=start, state=round(total, 2), sum=round(total, 2))
-        )
     return stats
 
 
@@ -399,11 +377,6 @@ async def async_import_history(
 
     for account_id in coordinator.data or {}:
         info = coordinator.data[account_id].get("info") or {}
-        regimes_by_lspu = {
-            s.get("lspuId"): s.get("regimes") or []
-            for s in info.get("services") or []
-            if _is_billed_service(s)
-        }
         starts: set[datetime] = set()
         for counter in info.get("counters") or []:
             uuid = counter.get("uuid")
@@ -422,15 +395,6 @@ async def async_import_history(
                 ),
                 unit,
                 lambda stats=stats: stats,
-            )
-            add(
-                registry.async_get_entity_id(
-                    "sensor", DOMAIN, f"{DOMAIN}_{uuid}_cost"
-                ),
-                "₽",
-                lambda counter=counter: _cost_stats(
-                    counter, regimes_by_lspu.get(counter.get("lspuId")) or []
-                ),
             )
         jobs.extend(_price_jobs(hass, registry, info, starts))
 
