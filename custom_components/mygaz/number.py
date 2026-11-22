@@ -103,10 +103,15 @@ class MyGazReadingNumber(CoordinatorEntity[MyGazCoordinator], NumberEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Typed-in value if pending, else the last reading of the zone."""
-        pending = self.coordinator.pending_for(str(self._counter_uuid))
+        """Typed-in value if pending, else the just-submitted value the
+        cabinet does not list yet, else the last reading of the zone."""
+        uuid = str(self._counter_uuid)
+        pending = self.coordinator.pending_for(uuid)
         if self._zone in pending:
             return pending[self._zone]
+        submitted = self.coordinator.submitted_for(uuid)
+        if self._zone in submitted:
+            return submitted[self._zone]
         reading = _latest_reading(self._counter())
         return _float(reading.get(_ZONE_VALUE_FIELDS[self._zone]))
 
@@ -117,6 +122,9 @@ class MyGazReadingNumber(CoordinatorEntity[MyGazCoordinator], NumberEntity):
         return {
             "zone": self._zone,
             "pending": self.coordinator.pending_for(
+                str(self._counter_uuid)
+            ).get(self._zone),
+            "submitted": self.coordinator.submitted_for(
                 str(self._counter_uuid)
             ).get(self._zone),
             "serial_number": counter.get("serialNumber"),
